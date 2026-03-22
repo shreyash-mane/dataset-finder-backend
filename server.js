@@ -4,7 +4,12 @@ const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+app.options("*", cors());
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
