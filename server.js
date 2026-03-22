@@ -113,40 +113,81 @@ app.post("/api/search", async (req, res) => {
   info.count += 1;
 
   try {
-    const message = await client.messages.create({
-      model: "claude-sonnet-4-5",
-      max_tokens: 4000,
-      system: SYSTEM_PROMPT,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [
-        {
-          role: "user",
-          content:
-            "Search the internet right now and find the best 3 real datasets for: " +
-            query.trim() +
-            ". Search Kaggle, HuggingFace, UCI ML Repository, PapersWithCode, Zenodo, and Google Dataset Search to find real existing datasets with real URLs, real paper citations, and accurate metadata.",
-        },
-      ],
-    });
+    let datasets = null;
+    let mode = "live";
 
-    const text = (message.content || [])
-      .filter((c) => c.type === "text")
-      .map((c) => c.text || "")
-      .join("");
+    // ── Try live web search first ─────────────────────────────────────────────
+    try {
+      const message = await client.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 4000,
+        system: SYSTEM_PROMPT,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [
+          {
+            role: "user",
+            content:
+              "Search the internet right now and find the best 3 real datasets for: " +
+              query.trim() +
+              ". Search Kaggle, HuggingFace, UCI ML Repository, PapersWithCode, Zenodo, and Google Dataset Search to find real existing datasets with real URLs, real paper citations, and accurate metadata.",
+          },
+        ],
+      });
 
-    if (!text) {
-      return res.status(500).json({ error: "Empty response from AI. Please try again." });
+      const text = (message.content || [])
+        .filter((c) => c.type === "text")
+        .map((c) => c.text || "")
+        .join("");
+
+      if (text) {
+        const jsonMatch = text.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          datasets = JSON.parse(jsonMatch[0]);
+          mode = "live";
+        }
+      }
+    } catch (liveErr) {
+      console.log("Live search failed, trying fallback:", liveErr.message);
     }
 
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      return res.status(500).json({ error: "Could not parse AI response. Please try again." });
+    // ── Fallback: use Claude knowledge without web search ─────────────────────
+    if (!datasets) {
+      try {
+        const fallbackMessage = await client.messages.create({
+          model: "claude-sonnet-4-5",
+          max_tokens: 4000,
+          system: SYSTEM_PROMPT,
+          messages: [
+            {
+              role: "user",
+              content: "Find the best 3 datasets for: " + query.trim() + ". Use your training knowledge to recommend well-known datasets with accurate details.",
+            },
+          ],
+        });
+
+        const fallbackText = (fallbackMessage.content || [])
+          .filter((c) => c.type === "text")
+          .map((c) => c.text || "")
+          .join("");
+
+        if (fallbackText) {
+          const jsonMatch = fallbackText.match(/\[[\s\S]*\]/);
+          if (jsonMatch) {
+            datasets = JSON.parse(jsonMatch[0]);
+            mode = "fallback";
+          }
+        }
+      } catch (fallbackErr) {
+        console.log("Fallback also failed:", fallbackErr.message);
+      }
     }
 
-    const datasets = JSON.parse(jsonMatch[0]);
+    if (!datasets) {
+      return res.status(500).json({ error: "Search failed. Please try again." });
+    }
+
     const remaining = Math.max(0, MAX_SEARCHES_PER_DAY - info.count);
-
-    return res.json({ datasets, remaining, used: info.count, max: MAX_SEARCHES_PER_DAY });
+    return res.json({ datasets, remaining, used: info.count, max: MAX_SEARCHES_PER_DAY, mode });
   } catch (err) {
     // If the API call failed, refund the search
     info.count = Math.max(0, info.count - 1);
