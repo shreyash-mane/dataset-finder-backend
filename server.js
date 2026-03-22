@@ -11,7 +11,9 @@ app.use(cors({
 }));
 app.options("*", cors());
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+console.log("API Key loaded:", ANTHROPIC_API_KEY ? "YES (length=" + ANTHROPIC_API_KEY.length + ")" : "NO - MISSING!");
+const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ── Rate limiter: 5 searches per user per day (stored in memory) ──────────────
 // In production you can swap this for Redis for persistence across restarts
