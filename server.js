@@ -149,7 +149,7 @@ app.post("/api/search", async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+const PORT = parseInt(process.env.PORT) || 3001;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dataset Finder backend running on port ${PORT}`);
 });
