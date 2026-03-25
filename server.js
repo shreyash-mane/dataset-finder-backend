@@ -200,30 +200,6 @@ Each dataset object must have these exact keys:
 
 Rank by reliabilityScore descending. Return ONLY the raw JSON array.`;
 
-// ── Serper Real-Time Search ───────────────────────────────────────────────────
-async function serperSearch(query) {
-  if (!SERPER_API_KEY) return null;
-  try {
-    const res = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ q: query + " dataset site:kaggle.com OR site:huggingface.co OR site:paperswithcode.com OR site:zenodo.org OR site:github.com", num: 10 }),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    // Format results as context for Claude
-    const results = (data.organic || []).slice(0, 8).map(r => `Title: ${r.title}
-URL: ${r.link}
-Snippet: ${r.snippet}`).join("
-
-");
-    return results || null;
-  } catch (err) {
-    console.log("Serper search failed:", err.message);
-    return null;
-  }
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ════════════════════════════════════════════════════════════════════════════
