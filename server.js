@@ -24,6 +24,7 @@ const GOOGLE_SECRET     = process.env.GOOGLE_CLIENT_SECRET;
 const GITHUB_CLIENT_ID  = process.env.GITHUB_CLIENT_ID;
 const GITHUB_SECRET     = process.env.GITHUB_CLIENT_SECRET;
 const FRONTEND_URL      = process.env.FRONTEND_URL || "https://dataset-finder-frontend.vercel.app";
+const SERPER_API_KEY    = process.env.SERPER_API_KEY;
 const PORT              = parseInt(process.env.PORT) || 3001;
 
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "YES" : "NO - MISSING!");
@@ -199,6 +200,30 @@ Each dataset object must have these exact keys:
 
 Rank by reliabilityScore descending. Return ONLY the raw JSON array.`;
 
+// ── Serper Real-Time Search ───────────────────────────────────────────────────
+async function serperSearch(query) {
+  if (!SERPER_API_KEY) return null;
+  try {
+    const res = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: query + " dataset site:kaggle.com OR site:huggingface.co OR site:paperswithcode.com OR site:zenodo.org OR site:github.com", num: 10 }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    // Format results as context for Claude
+    const results = (data.organic || []).slice(0, 8).map(r => `Title: ${r.title}
+URL: ${r.link}
+Snippet: ${r.snippet}`).join("
+
+");
+    return results || null;
+  } catch (err) {
+    console.log("Serper search failed:", err.message);
+    return null;
+  }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ════════════════════════════════════════════════════════════════════════════
@@ -293,20 +318,54 @@ app.post("/api/search", async (req, res) => {
   let datasets = null;
   let mode = "fast";
 
-  // ── Live web search (only when explicitly requested) ──────────────────────
+  // ── Live web search using Serper free API ────────────────────────────────
   if (liveSearch) {
     try {
-      const message = await client.messages.create({
-        model: "claude-sonnet-4-5",
-        max_tokens: 3000,
-        system: SYSTEM_PROMPT,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        messages: [{ role: "user", content: "Search the internet right now and " + userMessage + ". Search Kaggle, HuggingFace, PapersWithCode, Zenodo." }],
-      });
-      const text = (message.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
-      if (text) {
-        const jsonMatch = text.match(/\[[\s\S]*\]/);
-        if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "live"; }
+      let serperContext = null;
+      // Try Serper free real-time Google search first
+      if (SERPER_API_KEY) {
+        const serperRes = await fetch("https://google.serper.dev/search", {
+          method: "POST",
+          headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify({ q: query.trim() + " dataset site:kaggle.com OR site:huggingface.co OR site:paperswithcode.com OR site:zenodo.org", num: 10 }),
+        });
+        if (serperRes.ok) {
+          const serperData = await serperRes.json();
+          serperContext = (serperData.organic || []).slice(0, 8)
+            .map(r => "Title: " + r.title + "\nURL: " + r.link + "\nSnippet: " + r.snippet)
+            .join("\n\n");
+          console.log("Serper returned", (serperData.organic || []).length, "results");
+        }
+      }
+
+      if (serperContext) {
+        // Use Haiku + Serper results — fast AND real-time!
+        const livePrompt = "Here are real-time Google search results for '" + query.trim() + "':\n\n" + serperContext + "\n\nBased on these actual search results, " + userMessage + ". Use the real URLs from the search results.";
+        const message = await client.messages.create({
+          model: "claude-haiku-4-5",
+          max_tokens: 2000,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: livePrompt }],
+        });
+        const text = (message.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
+        if (text) {
+          const jsonMatch = text.match(/\[[\s\S]*\]/);
+          if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "live"; }
+        }
+      } else {
+        // Fallback to Anthropic web search if no Serper key
+        const message = await client.messages.create({
+          model: "claude-sonnet-4-5",
+          max_tokens: 3000,
+          system: SYSTEM_PROMPT,
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          messages: [{ role: "user", content: "Search the internet right now and " + userMessage }],
+        });
+        const text = (message.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
+        if (text) {
+          const jsonMatch = text.match(/\[[\s\S]*\]/);
+          if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "live"; }
+        }
       }
     } catch (err) { console.log("Live search failed, trying fast:", err.message); }
   }
