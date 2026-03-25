@@ -78,6 +78,15 @@ const savedDatasetSchema = new mongoose.Schema({
 });
 const SavedDataset = mongoose.model("SavedDataset", savedDatasetSchema);
 
+// ── Search Cache Schema ──────────────────────────────────────────────────────
+const searchCacheSchema = new mongoose.Schema({
+  queryKey:  { type: String, required: true, unique: true }, // normalized query
+  datasets:  [ Object ],
+  mode:      { type: String, default: "fast" },
+  createdAt: { type: Date, default: Date.now, expires: 86400 }, // auto-delete after 24h
+});
+const SearchCache = mongoose.model("SearchCache", searchCacheSchema);
+
 // ── Auth Helpers ──────────────────────────────────────────────────────────────
 const generateToken = (userId) => jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
 const authMiddleware = async (req, res, next) => {
@@ -251,7 +260,7 @@ app.get("/api/rate-limit", (req, res) => {
 });
 
 app.post("/api/search", async (req, res) => {
-  const { query } = req.body;
+  const { query, liveSearch } = req.body;
   if (!query?.trim()) return res.status(400).json({ error: "Query is required." });
   if (query.trim().length > 300) return res.status(400).json({ error: "Query too long." });
 
@@ -261,57 +270,86 @@ app.post("/api/search", async (req, res) => {
     const resetIn = Math.ceil((info.resetAt - Date.now()) / 1000 / 60);
     return res.status(429).json({ error: `You've used all 5 free searches for today. Resets in ${resetIn} minutes.`, resetInMinutes: resetIn });
   }
-  info.count += 1;
 
   const parsed = parseSmartQuery(query.trim());
-  const userMessage = parsed.prompt + ". Search Kaggle, HuggingFace, UCI ML Repository, PapersWithCode, Zenodo. Include only recent papers (2020-2025) sorted newest first.";
+  const cacheKey = query.trim().toLowerCase().replace(/\s+/g, " ");
 
+  // ── Check cache first (unless liveSearch requested) ───────────────────────
+  if (!liveSearch) {
+    try {
+      const cached = await SearchCache.findOne({ queryKey: cacheKey });
+      if (cached) {
+        console.log("Cache hit for:", cacheKey);
+        const remaining = Math.max(0, MAX_SEARCHES_PER_DAY - info.count);
+        return res.json({ datasets: cached.datasets, remaining, used: info.count, max: MAX_SEARCHES_PER_DAY, mode: "cached", queryType: parsed.type, fromCache: true });
+      }
+    } catch (err) { console.log("Cache check failed:", err.message); }
+  }
+
+  // Only count against rate limit for actual API calls
+  info.count += 1;
+
+  const userMessage = parsed.prompt + ". Include only recent papers (2020-2025) sorted newest first.";
   let datasets = null;
-  let mode = "live";
+  let mode = "fast";
 
-  // ── Try live web search first ─────────────────────────────────────────────
-  try {
-    const message = await client.messages.create({
-      model: "claude-sonnet-4-5",
-      max_tokens: 4000,
-      system: SYSTEM_PROMPT,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{ role: "user", content: "Search the internet right now and " + userMessage }],
-    });
-    const text = (message.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
-    if (text) {
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "live"; }
-    }
-  } catch (err) { console.log("Live search failed, trying fallback:", err.message); }
+  // ── Live web search (only when explicitly requested) ──────────────────────
+  if (liveSearch) {
+    try {
+      const message = await client.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 3000,
+        system: SYSTEM_PROMPT,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [{ role: "user", content: "Search the internet right now and " + userMessage + ". Search Kaggle, HuggingFace, PapersWithCode, Zenodo." }],
+      });
+      const text = (message.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
+      if (text) {
+        const jsonMatch = text.match(/\[[\s\S]*\]/);
+        if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "live"; }
+      }
+    } catch (err) { console.log("Live search failed, trying fast:", err.message); }
+  }
 
-  // ── Fallback: Claude knowledge ────────────────────────────────────────────
+  // ── Fast search using Haiku (default, ~2-3 sec) ───────────────────────────
   if (!datasets) {
     try {
-      const fallback = await client.messages.create({
-        model: "claude-sonnet-4-5",
-        max_tokens: 4000,
+      const message = await client.messages.create({
+        model: "claude-haiku-4-5",
+        max_tokens: 2000,
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
       });
-      const text = (fallback.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
+      const text = (message.content || []).filter(c => c.type === "text").map(c => c.text || "").join("");
       if (text) {
         const jsonMatch = text.match(/\[[\s\S]*\]/);
-        if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "fallback"; }
+        if (jsonMatch) { datasets = JSON.parse(jsonMatch[0]); mode = "fast"; }
       }
-    } catch (err) { console.log("Fallback failed:", err.message); }
+    } catch (err) { console.log("Fast search failed:", err.message); }
   }
 
-  if (!datasets) { info.count = Math.max(0, info.count - 1); return res.status(500).json({ error: "Search failed. Please try again." }); }
+  if (!datasets) {
+    info.count = Math.max(0, info.count - 1);
+    return res.status(500).json({ error: "Search failed. Please try again." });
+  }
 
-  // Sort papers within each dataset newest first
+  // Sort papers newest first
   datasets = datasets.map(ds => ({
     ...ds,
     papers: (ds.papers || []).sort((a, b) => (b.year || 0) - (a.year || 0))
   }));
 
+  // ── Save to cache ─────────────────────────────────────────────────────────
+  try {
+    await SearchCache.findOneAndUpdate(
+      { queryKey: cacheKey },
+      { queryKey: cacheKey, datasets, mode },
+      { upsert: true, new: true }
+    );
+  } catch (err) { console.log("Cache save failed:", err.message); }
+
   const remaining = Math.max(0, MAX_SEARCHES_PER_DAY - info.count);
-  return res.json({ datasets, remaining, used: info.count, max: MAX_SEARCHES_PER_DAY, mode, queryType: parsed.type });
+  return res.json({ datasets, remaining, used: info.count, max: MAX_SEARCHES_PER_DAY, mode, queryType: parsed.type, fromCache: false });
 });
 
 // ── Collections ───────────────────────────────────────────────────────────────
