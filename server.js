@@ -245,9 +245,13 @@ app.post("/auth/login", async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
     const user = await User.findOne({ email });
-    if (!user || !user.password) return res.status(401).json({ error: "Invalid email or password" });
+    if (!user) return res.status(401).json({ error: "No account found with that email." });
+    if (!user.password) {
+      const provider = user.provider === 'google' ? 'Google' : user.provider === 'github' ? 'GitHub' : 'social login';
+      return res.status(401).json({ error: `This account uses ${provider}. Click "Sign in with ${provider}" below, or use Forgot Password to set a password.` });
+    }
     const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(401).json({ error: "Invalid email or password" });
+    if (!valid) return res.status(401).json({ error: "Incorrect password." });
     const token = generateToken(user._id);
     res.json({ token, user: { id: user._id, name: user.name, email: user.email, avatar: user.avatar } });
   } catch (err) { res.status(500).json({ error: "Login failed" }); }
