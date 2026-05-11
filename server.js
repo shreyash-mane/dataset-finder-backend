@@ -8,8 +8,8 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const GitHubStrategy = require("passport-github2").Strategy;
 const Anthropic = require("@anthropic-ai/sdk");
 const PDFDocument = require("pdfkit");
-const nodemailer = require("nodemailer");
 const twilio = require("twilio");
+const Resend = require("resend").Resend;
 
 const app = express();
 app.use(express.json());
@@ -27,11 +27,11 @@ const GITHUB_CLIENT_ID  = process.env.GITHUB_CLIENT_ID;
 const GITHUB_SECRET     = process.env.GITHUB_CLIENT_SECRET;
 const FRONTEND_URL      = process.env.FRONTEND_URL || "https://dataset-finder-frontend.vercel.app";
 const SERPER_API_KEY    = process.env.SERPER_API_KEY;
-const EMAIL_USER        = process.env.EMAIL_USER;
-const EMAIL_PASS        = process.env.EMAIL_PASS;
+const RESEND_API_KEY    = process.env.RESEND_API_KEY;
+const FROM_EMAIL        = process.env.FROM_EMAIL || "otp@data-lab.co.uk";
 const TWILIO_SID        = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_TOKEN      = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM       = process.env.TWILIO_FROM;
+const TWILIO_SERVICE_SID = process.env.TWILIO_SERVICE_SID;
 const PORT              = parseInt(process.env.PORT) || 3001;
 
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "YES" : "NO - MISSING!");
@@ -142,13 +142,11 @@ passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => { const user = await User.findById(id); done(null, user); });
 
 // ── Email / SMS helpers ───────────────────────────────────────────────────────
-const emailTransporter = EMAIL_USER && EMAIL_PASS
-  ? nodemailer.createTransport({ service: "gmail", auth: { user: EMAIL_USER, pass: EMAIL_PASS } })
-  : null;
+const resendClient = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 const twilioClient = TWILIO_SID && TWILIO_TOKEN ? twilio(TWILIO_SID, TWILIO_TOKEN) : null;
 
-// OTP store: key (email or E.164 phone) → { otp, expiry }
+// OTP store: email → { otp, expiry }  (phone OTP handled by Twilio Verify)
 const otpStore = new Map();
 
 function generateOtp() {
@@ -286,12 +284,12 @@ app.post("/auth/forgot/send-email", async (req, res) => {
     const otp = generateOtp();
     otpStore.set(email.trim().toLowerCase(), { otp, expiry: Date.now() + 10 * 60 * 1000 });
 
-    if (!emailTransporter) return res.status(503).json({ error: "Email service not configured." });
+    if (!resendClient) return res.status(503).json({ error: "Email service not configured." });
 
-    await emailTransporter.sendMail({
-      from: `"DataLab" <${EMAIL_USER}>`,
-      to: email.trim(),
-      subject: "DataLab Password Reset OTP",
+    await resendClient.emails.send({
+      from: `DataLab <${FROM_EMAIL}>`,
+      to: [email.trim()],
+      subject: `Your DataLab OTP: ${otp}`,
       html: `
         <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#030712;color:#e0e8ff;border-radius:16px;">
           <div style="font-size:28px;font-weight:800;margin-bottom:4px;">🧪 DataLab</div>
@@ -310,21 +308,16 @@ app.post("/auth/forgot/send-email", async (req, res) => {
   }
 });
 
-// Send OTP to phone via SMS
+// Send OTP to phone via Twilio Verify (handles generation + delivery)
 app.post("/auth/forgot/send-phone", async (req, res) => {
-  const { phone } = req.body; // expects E.164 e.g. "+14155552671"
+  const { phone } = req.body; // expects E.164 e.g. "+447911123456"
   if (!phone?.trim()) return res.status(400).json({ error: "Phone number is required." });
   try {
-    if (!twilioClient) return res.status(503).json({ error: "SMS service not configured." });
+    if (!twilioClient || !TWILIO_SERVICE_SID) return res.status(503).json({ error: "SMS service not configured." });
 
-    const otp = generateOtp();
-    otpStore.set(phone.trim(), { otp, expiry: Date.now() + 10 * 60 * 1000 });
+    await twilioClient.verify.v2.services(TWILIO_SERVICE_SID)
+      .verifications.create({ to: phone.trim(), channel: "sms" });
 
-    await twilioClient.messages.create({
-      body: `Your DataLab password reset OTP is: ${otp}. Valid for 10 minutes.`,
-      from: TWILIO_FROM,
-      to: phone.trim(),
-    });
     res.json({ success: true, message: "OTP sent via SMS." });
   } catch (err) {
     console.error("SMS OTP error:", err.message);
@@ -366,27 +359,37 @@ app.post("/auth/forgot/reset", async (req, res) => {
   }
 });
 
-// Verify OTP only (for phone flow — confirms identity, then reset separately)
-app.post("/auth/forgot/verify-otp", (req, res) => {
-  const { key, otp } = req.body;
-  if (!key || !otp) return res.status(400).json({ error: "Key and OTP required." });
-  const stored = otpStore.get(key.trim().toLowerCase()) || otpStore.get(key.trim());
-  if (!stored) return res.status(400).json({ error: "No OTP found. Please request a new one." });
-  if (Date.now() > stored.expiry) { otpStore.delete(key); return res.status(400).json({ error: "OTP expired." }); }
-  if (stored.otp !== otp.trim()) return res.status(400).json({ error: "Incorrect OTP." });
-  // Mark verified so reset endpoint can proceed
-  otpStore.set(key.trim().toLowerCase() || key.trim(), { ...stored, verified: true });
-  res.json({ success: true });
+// Verify phone OTP via Twilio Verify
+app.post("/auth/forgot/verify-otp", async (req, res) => {
+  const { key, otp } = req.body; // key = E.164 phone number
+  if (!key || !otp) return res.status(400).json({ error: "Phone and OTP required." });
+  try {
+    if (!twilioClient || !TWILIO_SERVICE_SID) return res.status(503).json({ error: "SMS service not configured." });
+
+    const check = await twilioClient.verify.v2.services(TWILIO_SERVICE_SID)
+      .verificationChecks.create({ to: key.trim(), code: otp.trim() });
+
+    if (check.status !== "approved") return res.status(400).json({ error: "Incorrect or expired OTP." });
+
+    // Mark phone as verified in memory so reset endpoint can proceed
+    otpStore.set(key.trim(), { verified: true, expiry: Date.now() + 10 * 60 * 1000 });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Verify OTP error:", err.message);
+    res.status(400).json({ error: "Incorrect or expired OTP." });
+  }
 });
 
-// Reset password for phone-verified users (using email after phone OTP verified)
+// Reset password for phone-verified users
 app.post("/auth/forgot/reset-phone", async (req, res) => {
   const { phone, email, newPassword } = req.body;
   if (!phone || !email || !newPassword) return res.status(400).json({ error: "All fields required." });
   if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
 
   const stored = otpStore.get(phone.trim());
-  if (!stored?.verified) return res.status(400).json({ error: "Phone OTP not verified." });
+  if (!stored?.verified || Date.now() > stored.expiry) {
+    return res.status(400).json({ error: "Phone not verified. Please request a new OTP." });
+  }
 
   try {
     const user = await User.findOne({ email: email.trim().toLowerCase() });
