@@ -279,7 +279,6 @@ app.post("/auth/forgot/send-email", async (req, res) => {
   try {
     const user = await User.findOne({ email: email.trim().toLowerCase() });
     if (!user) return res.status(404).json({ error: "No account found with that email." });
-    if (user.provider !== "email") return res.status(400).json({ error: "This account uses social login. Please sign in with Google or GitHub." });
 
     const otp = generateOtp();
     otpStore.set(email.trim().toLowerCase(), { otp, expiry: Date.now() + 10 * 60 * 1000 });
