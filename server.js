@@ -8,6 +8,8 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const GitHubStrategy = require("passport-github2").Strategy;
 const Anthropic = require("@anthropic-ai/sdk");
 const PDFDocument = require("pdfkit");
+const nodemailer = require("nodemailer");
+const twilio = require("twilio");
 
 const app = express();
 app.use(express.json());
@@ -25,6 +27,11 @@ const GITHUB_CLIENT_ID  = process.env.GITHUB_CLIENT_ID;
 const GITHUB_SECRET     = process.env.GITHUB_CLIENT_SECRET;
 const FRONTEND_URL      = process.env.FRONTEND_URL || "https://dataset-finder-frontend.vercel.app";
 const SERPER_API_KEY    = process.env.SERPER_API_KEY;
+const EMAIL_USER        = process.env.EMAIL_USER;
+const EMAIL_PASS        = process.env.EMAIL_PASS;
+const TWILIO_SID        = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_TOKEN      = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_FROM       = process.env.TWILIO_FROM;
 const PORT              = parseInt(process.env.PORT) || 3001;
 
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "YES" : "NO - MISSING!");
@@ -133,6 +140,20 @@ if (GITHUB_CLIENT_ID && GITHUB_SECRET) {
 
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => { const user = await User.findById(id); done(null, user); });
+
+// ── Email / SMS helpers ───────────────────────────────────────────────────────
+const emailTransporter = EMAIL_USER && EMAIL_PASS
+  ? nodemailer.createTransport({ service: "gmail", auth: { user: EMAIL_USER, pass: EMAIL_PASS } })
+  : null;
+
+const twilioClient = TWILIO_SID && TWILIO_TOKEN ? twilio(TWILIO_SID, TWILIO_TOKEN) : null;
+
+// OTP store: key (email or E.164 phone) → { otp, expiry }
+const otpStore = new Map();
+
+function generateOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
 
 // ── Rate Limiter ──────────────────────────────────────────────────────────────
 const rateLimitMap = new Map();
@@ -249,6 +270,136 @@ app.get("/auth/github/callback", passport.authenticate("github", { session: fals
 
 app.get("/auth/me", authMiddleware, (req, res) => {
   res.json({ id: req.user._id, name: req.user.name, email: req.user.email, avatar: req.user.avatar });
+});
+
+// ── Forgot Password ───────────────────────────────────────────────────────────
+
+// Send OTP to email
+app.post("/auth/forgot/send-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email?.trim()) return res.status(400).json({ error: "Email is required." });
+  try {
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
+    if (!user) return res.status(404).json({ error: "No account found with that email." });
+    if (user.provider !== "email") return res.status(400).json({ error: "This account uses social login. Please sign in with Google or GitHub." });
+
+    const otp = generateOtp();
+    otpStore.set(email.trim().toLowerCase(), { otp, expiry: Date.now() + 10 * 60 * 1000 });
+
+    if (!emailTransporter) return res.status(503).json({ error: "Email service not configured." });
+
+    await emailTransporter.sendMail({
+      from: `"DataLab" <${EMAIL_USER}>`,
+      to: email.trim(),
+      subject: "DataLab Password Reset OTP",
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#030712;color:#e0e8ff;border-radius:16px;">
+          <div style="font-size:28px;font-weight:800;margin-bottom:4px;">🧪 DataLab</div>
+          <div style="color:#4a5a7a;font-size:13px;margin-bottom:24px;">Password Reset</div>
+          <p style="color:#8899bb;">Use the OTP below to reset your password. It expires in <strong>10 minutes</strong>.</p>
+          <div style="background:#0d1b3e;border:1px solid #1e3a8a;border-radius:12px;padding:24px;text-align:center;margin:24px 0;">
+            <div style="font-size:36px;font-weight:900;letter-spacing:10px;color:#6fa3ef;font-family:monospace;">${otp}</div>
+          </div>
+          <p style="color:#4a5a7a;font-size:12px;">If you didn't request this, ignore this email.</p>
+        </div>`,
+    });
+    res.json({ success: true, message: "OTP sent to your email." });
+  } catch (err) {
+    console.error("Email OTP error:", err.message);
+    res.status(500).json({ error: "Failed to send email. Please try again." });
+  }
+});
+
+// Send OTP to phone via SMS
+app.post("/auth/forgot/send-phone", async (req, res) => {
+  const { phone } = req.body; // expects E.164 e.g. "+14155552671"
+  if (!phone?.trim()) return res.status(400).json({ error: "Phone number is required." });
+  try {
+    if (!twilioClient) return res.status(503).json({ error: "SMS service not configured." });
+
+    const otp = generateOtp();
+    otpStore.set(phone.trim(), { otp, expiry: Date.now() + 10 * 60 * 1000 });
+
+    await twilioClient.messages.create({
+      body: `Your DataLab password reset OTP is: ${otp}. Valid for 10 minutes.`,
+      from: TWILIO_FROM,
+      to: phone.trim(),
+    });
+    res.json({ success: true, message: "OTP sent via SMS." });
+  } catch (err) {
+    console.error("SMS OTP error:", err.message);
+    res.status(500).json({ error: "Failed to send SMS. Check the phone number and try again." });
+  }
+});
+
+// Verify OTP + reset password in one step
+app.post("/auth/forgot/reset", async (req, res) => {
+  const { key, otp, newPassword } = req.body; // key = email or phone
+  if (!key || !otp || !newPassword) return res.status(400).json({ error: "All fields required." });
+  if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+
+  const stored = otpStore.get(key.trim().toLowerCase()) || otpStore.get(key.trim());
+  if (!stored) return res.status(400).json({ error: "No OTP found. Please request a new one." });
+  if (Date.now() > stored.expiry) { otpStore.delete(key); return res.status(400).json({ error: "OTP expired. Please request a new one." }); }
+  if (stored.otp !== otp.trim()) return res.status(400).json({ error: "Incorrect OTP." });
+
+  try {
+    // Find user by email or phone (email-based lookup for both flows since phone isn't stored)
+    const isEmail = key.includes("@");
+    let user;
+    if (isEmail) {
+      user = await User.findOne({ email: key.trim().toLowerCase() });
+    } else {
+      return res.status(400).json({ error: "Phone-based reset: please log in with your email after resetting via phone." });
+    }
+    if (!user) return res.status(404).json({ error: "User not found." });
+
+    user.password = await bcrypt.hash(newPassword, 12);
+    await user.save();
+    otpStore.delete(key.trim().toLowerCase());
+    otpStore.delete(key.trim());
+
+    const token = generateToken(user._id);
+    res.json({ success: true, token, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ error: "Password reset failed." });
+  }
+});
+
+// Verify OTP only (for phone flow — confirms identity, then reset separately)
+app.post("/auth/forgot/verify-otp", (req, res) => {
+  const { key, otp } = req.body;
+  if (!key || !otp) return res.status(400).json({ error: "Key and OTP required." });
+  const stored = otpStore.get(key.trim().toLowerCase()) || otpStore.get(key.trim());
+  if (!stored) return res.status(400).json({ error: "No OTP found. Please request a new one." });
+  if (Date.now() > stored.expiry) { otpStore.delete(key); return res.status(400).json({ error: "OTP expired." }); }
+  if (stored.otp !== otp.trim()) return res.status(400).json({ error: "Incorrect OTP." });
+  // Mark verified so reset endpoint can proceed
+  otpStore.set(key.trim().toLowerCase() || key.trim(), { ...stored, verified: true });
+  res.json({ success: true });
+});
+
+// Reset password for phone-verified users (using email after phone OTP verified)
+app.post("/auth/forgot/reset-phone", async (req, res) => {
+  const { phone, email, newPassword } = req.body;
+  if (!phone || !email || !newPassword) return res.status(400).json({ error: "All fields required." });
+  if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+
+  const stored = otpStore.get(phone.trim());
+  if (!stored?.verified) return res.status(400).json({ error: "Phone OTP not verified." });
+
+  try {
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
+    if (!user) return res.status(404).json({ error: "No account found with that email." });
+    user.password = await bcrypt.hash(newPassword, 12);
+    await user.save();
+    otpStore.delete(phone.trim());
+
+    const token = generateToken(user._id);
+    res.json({ success: true, token, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ error: "Password reset failed." });
+  }
 });
 
 // ── Search ────────────────────────────────────────────────────────────────────
